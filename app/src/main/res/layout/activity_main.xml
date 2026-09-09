@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/main"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <com.example.kassa.KioskWebView
+        android:id="@+id/webView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <LinearLayout
+        android:id="@+id/statusOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#FAFAFA"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="32dp">
+        <ProgressBar android:id="@+id/statusProgress" android:layout_width="48dp" android:layout_height="48dp" android:layout_marginBottom="20dp" />
+        <TextView android:id="@+id/statusTitle" android:layout_width="wrap_content" android:layout_height="wrap_content" android:gravity="center" android:text="Hüttenbuch" android:textColor="#18181B" android:textSize="28sp" android:textStyle="bold" />
+        <TextView android:id="@+id/statusMessage" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:gravity="center" android:maxWidth="720dp" android:textColor="#52525B" android:textSize="16sp" />
+        <Button android:id="@+id/statusPrimaryButton" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="24dp" android:visibility="gone" />
+    </LinearLayout>
+
+    <ScrollView
+        android:id="@+id/diagnosticsPanel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#F4F4F5"
+        android:fillViewport="true"
+        android:visibility="gone">
+
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="12dp">
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Admin &amp; Diagnose" android:textColor="#18181B" android:textSize="24sp" android:textStyle="bold" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="4dp" android:text="Kassenstatus, Hardware und Wartung" android:textColor="#71717A" android:textSize="15sp" />
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="STATUS" android:textColor="#71717A" android:textSize="12sp" android:textStyle="bold" />
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:baselineAligned="false" android:orientation="horizontal">
+                <LinearLayout android:layout_width="0dp" android:layout_height="70dp" android:layout_weight="1" android:background="#FFFFFF" android:gravity="center_vertical" android:orientation="vertical" android:padding="12dp">
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Server" android:textColor="#71717A" android:textSize="13sp" />
+                    <TextView android:id="@+id/statusServerValue" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="3dp" android:text="–" android:textColor="#18181B" android:textSize="17sp" android:textStyle="bold" />
+                </LinearLayout>
+                <LinearLayout android:layout_width="0dp" android:layout_height="70dp" android:layout_marginStart="8dp" android:layout_weight="1" android:background="#FFFFFF" android:gravity="center_vertical" android:orientation="vertical" android:padding="12dp">
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Terminal" android:textColor="#71717A" android:textSize="13sp" />
+                    <TextView android:id="@+id/statusTerminalValue" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="3dp" android:text="–" android:textColor="#18181B" android:textSize="17sp" android:textStyle="bold" />
+                </LinearLayout>
+                <LinearLayout android:layout_width="0dp" android:layout_height="70dp" android:layout_marginStart="8dp" android:layout_weight="1" android:background="#FFFFFF" android:gravity="center_vertical" android:orientation="vertical" android:padding="12dp">
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Hardware" android:textColor="#71717A" android:textSize="13sp" />
+                    <TextView android:id="@+id/statusReaderValue" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="3dp" android:text="–" android:textColor="#18181B" android:textSize="17sp" android:textStyle="bold" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="SYSTEM" android:textColor="#71717A" android:textSize="12sp" android:textStyle="bold" />
+            <TextView android:id="@+id/diagnosticsText" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:background="#FFFFFF" android:fontFamily="monospace" android:padding="12dp" android:textColor="#27272A" android:textIsSelectable="true" android:textSize="12sp" />
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="HARDWARE" android:textColor="#71717A" android:textSize="12sp" android:textStyle="bold" />
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:orientation="horizontal">
+                <Button android:id="@+id/buttonHardwareOverview" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="Hardware anzeigen" />
+                <Button android:id="@+id/buttonHardwareSelfTest" android:layout_width="0dp" android:layout_height="48dp" android:layout_marginStart="8dp" android:layout_weight="1" android:text="Hardware testen" />
+            </LinearLayout>
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="VERWALTUNG" android:textColor="#71717A" android:textSize="12sp" android:textStyle="bold" />
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:orientation="horizontal">
+                <Button android:id="@+id/buttonSettings" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="Konfiguration" />
+                <Button android:id="@+id/buttonReloadCashRegister" android:layout_width="0dp" android:layout_height="48dp" android:layout_marginStart="8dp" android:layout_weight="1" android:text="Kasse neu laden" />
+            </LinearLayout>
+
+            <Button android:id="@+id/buttonCloseDiagnostics" android:layout_width="match_parent" android:layout_height="52dp" android:layout_marginTop="10dp" android:text="Zur Kasse" android:textStyle="bold" />
+            <Button android:id="@+id/buttonExitApp" android:layout_width="match_parent" android:layout_height="42dp" android:layout_marginTop="6dp" android:text="App beenden" />
+        </LinearLayout>
+    </ScrollView>
+</FrameLayout>
