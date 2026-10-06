@@ -10,8 +10,8 @@ android {
         applicationId = "com.example.kassa"
         minSdk = 29
         targetSdk = 36
-        versionCode = 42
-        versionName = "1.3.0"
+        versionCode = 47
+        versionName = "1.3.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -99,7 +99,7 @@ class AndroidNfcService(
     }
 
     override fun onTagDiscovered(tag: Tag) {
-        val uid = tag.id?.joinToString("") { "%02X".format(it) } ?: return
+        val uid = tag.id?.joinToString("") { "%02X".format(it.toInt() and 0xFF) } ?: return
         val now = SystemClock.elapsedRealtime()
         lastSeenAt = now
         handler.removeCallbacks(presenceCheck)

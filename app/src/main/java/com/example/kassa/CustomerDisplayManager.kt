@@ -25,11 +25,9 @@ class CustomerDisplayManager(
     private var lastHtml: String? = null
     private var blankRequested = true
     private var disposed = false
-    @Volatile private var physicalPowerRequested = true
 
     init {
         displayManager.registerDisplayListener(this, mainHandler)
-        mainHandler.post { blank() }
     }
 
     /**
@@ -84,8 +82,6 @@ class CustomerDisplayManager(
             }
         }
 
-        physicalPowerRequested = enabled
-
         val serial = customerDisplaySerial()
         if (serial.isNullOrBlank()) {
             RuntimeLog.add(
@@ -106,7 +102,7 @@ class CustomerDisplayManager(
             activityContext.sendBroadcast(intent)
             RuntimeLog.add(
                 "display_power_requested",
-                "enabled=$enabled;sn=$serial"
+                "enabled=$enabled"
             )
             true
         }.getOrElse {
@@ -115,6 +111,25 @@ class CustomerDisplayManager(
                 "enabled=$enabled;${it.javaClass.simpleName}:${it.message}"
             )
             false
+        }
+    }
+
+    private fun hideCustomerDisplayNumber(serial: String) {
+        runCatching {
+            val intent = Intent(ACTION_SET_CONTROL).apply {
+                setPackage(SUNMI_USB_SCREEN_PACKAGE)
+                putExtra("sn", serial)
+                putExtra("type", TYPE_OPTION)
+                putExtra("key", KEY_NICKNAME_SHOW)
+                putExtra("value", VALUE_OFF)
+            }
+            activityContext.sendBroadcast(intent)
+            RuntimeLog.add("display_number_hidden")
+        }.onFailure {
+            RuntimeLog.add(
+                "display_number_hide_failed",
+                "${it.javaClass.simpleName}:${it.message}"
+            )
         }
     }
 
@@ -208,11 +223,18 @@ class CustomerDisplayManager(
 
     override fun onDisplayAdded(displayId: Int) {
         val added = displayManager.getDisplay(displayId)
-        SERIAL_REGEX.find(added?.name ?: "")?.value?.let { lastCustomerDisplaySerial = it }
+        SERIAL_REGEX.find(added?.name ?: "")?.value?.let {
+            lastCustomerDisplaySerial = it
+            hideCustomerDisplayNumber(it)
+        }
         RuntimeLog.add("display_added", "displayId=$displayId;name=${added?.name ?: ""}")
         mainHandler.post {
-            if (blankRequested) blank()
-            else lastHtml?.let { show(SUNMI_CUSTOMER_DISPLAY_ID, it) }
+            blank()
+            if (!blankRequested) {
+                lastHtml?.let { html ->
+                    mainHandler.post { show(SUNMI_CUSTOMER_DISPLAY_ID, html) }
+                }
+            }
         }
     }
 
@@ -262,9 +284,7 @@ class CustomerDisplayManager(
                 "display_webview_load",
                 "mode=reuse;displayId=${display.displayId};blank=$isBlank;htmlLength=${html.length}"
             )
-            currentWebView.loadDataWithBaseURL(
-                DISPLAY_BASE_URL, html, "text/html", "UTF-8", null
-            )
+            loadHtml(currentWebView, html)
             return true
         }
 
@@ -308,9 +328,7 @@ class CustomerDisplayManager(
                         "displayId=${display.displayId};blank=$isBlank"
                     )
 
-                    web.loadDataWithBaseURL(
-                        DISPLAY_BASE_URL, html, "text/html", "UTF-8", null
-                    )
+                    loadHtml(web, html)
                 }
             }
 
@@ -345,6 +363,19 @@ class CustomerDisplayManager(
             )
             false
         }
+    }
+
+    private fun loadHtml(webView: WebView, html: String) {
+        val encoded = android.util.Base64.encodeToString(
+            html.toByteArray(Charsets.UTF_8),
+            android.util.Base64.NO_WRAP
+        )
+
+        webView.loadData(
+            encoded,
+            "text/html",
+            "base64"
+        )
     }
 
     private fun resolveDisplay(deviceId: String): Display? {
@@ -413,12 +444,11 @@ class CustomerDisplayManager(
     companion object {
         const val SUNMI_CUSTOMER_DISPLAY_ID = "sunmi:display:customer"
 
-        private const val DISPLAY_BASE_URL = "https://kassa.local/"
-
         private const val SUNMI_USB_SCREEN_PACKAGE = "com.sunmi.usbscreen"
         private const val ACTION_SET_CONTROL = "com.sunmi.usbscreen.ACTION_SET_CONTROL"
         private const val TYPE_OPTION = 1
         private const val KEY_SCREEN_SW = 2
+        private const val KEY_NICKNAME_SHOW = 20
         private const val VALUE_OFF = 0
         private const val VALUE_ON = 1
         private const val DISPLAY_READY_POLL_MS = 100L

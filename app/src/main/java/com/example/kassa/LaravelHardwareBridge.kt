@@ -25,9 +25,9 @@ class LaravelHardwareBridge(
     @Volatile private var requestedNfcReaderId: String? = null
     @Volatile private var nfcSwitchGeneration: Long = 0
 
-    @JavascriptInterface fun getBridgeVersion() = "13"
+    @JavascriptInterface fun getBridgeVersion() = BRIDGE_VERSION.toString()
 
-    @JavascriptInterface fun getHardware(): String = JSONObject().put("bridgeVersion", 13)
+    @JavascriptInterface fun getHardware(): String = JSONObject().put("bridgeVersion", BRIDGE_VERSION)
         .put("hardware", registry.discover().toJsonArray()).put("laravelConfig", configService.load().toJson()).toString()
     @JavascriptInterface fun getHardwareConfig(): String = configService.load().toJson().toString()
     @JavascriptInterface fun setHardwareConfig(json: String): String = runCatching {
@@ -41,7 +41,7 @@ class LaravelHardwareBridge(
     @JavascriptInterface fun rescanHardware(): String = registry.discover().toJsonArray().toString()
     @JavascriptInterface fun getLogs(): String = RuntimeLog.json()
     @JavascriptInterface fun clearLogs(): String { RuntimeLog.clear(); return ok().toString() }
-    @JavascriptInterface fun getStatus(): String = JSONObject().put("success", true).put("bridgeVersion", 13)
+    @JavascriptInterface fun getStatus(): String = JSONObject().put("success", true).put("bridgeVersion", BRIDGE_VERSION)
         .put("hardware", registry.discover().toJsonArray()).put("config", configService.load().toJson())
         .put("payment", paymentManager.status()).put("nfcTest", getNfcTestStatusObject()).toString()
 
@@ -238,8 +238,8 @@ class LaravelHardwareBridge(
         result.toString()
     }.getOrElse { RuntimeLog.addHardware("printer_bridge", printerId, "FAILED", it.message ?: it.javaClass.simpleName); error("PRINT_INVALID", it.message) }
     @JavascriptInterface fun getPrinterStatus(): String = printerManager.status().put("success", true).toString()
-    @JavascriptInterface fun testDisplay(displayId: String): String = showCustomerDisplay(displayId, "<html><body style='font-family:sans-serif;text-align:center;padding-top:20%'><h1>Display OK</h1><p>Android Bridge v12</p></body></html>")
-    @JavascriptInterface fun testPrinter(printerId: String): String = printerManager.print(printerId, JSONObject().put("text", "YCH Clubheim\nAndroid Hardwaretest\nBridge v12\n").put("feedLines", 3).put("cut", true)).toString()
+    @JavascriptInterface fun testDisplay(displayId: String): String = showCustomerDisplay(displayId, "<html><body style='font-family:sans-serif;text-align:center;padding-top:20%'><h1>Display OK</h1><p>Android Bridge v$BRIDGE_VERSION</p></body></html>")
+    @JavascriptInterface fun testPrinter(printerId: String): String = printerManager.print(printerId, JSONObject().put("text", "YCH Clubheim\nAndroid Hardwaretest\nBridge v$BRIDGE_VERSION\n").put("feedLines", 3).put("cut", true)).toString()
 
     // SumUp Android integration is Tap-to-Pay on INTERNAL NFC only.
     // External SumUp readers are controlled by Laravel via the SumUp Cloud API.
@@ -266,7 +266,7 @@ class LaravelHardwareBridge(
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         val versionCode = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
         return JSONObject().put("success", true).put("versionCode", versionCode).put("versionName", info.versionName)
-            .put("bridgeVersion", 13).put("androidVersion", android.os.Build.VERSION.RELEASE)
+            .put("bridgeVersion", BRIDGE_VERSION).put("androidVersion", android.os.Build.VERSION.RELEASE)
             .put("manufacturer", android.os.Build.MANUFACTURER).put("model", android.os.Build.MODEL).toString()
     }
     @JavascriptInterface fun installUpdate(json: String): String = runCatching { updateManager.install(JSONObject(json)).toString() }.getOrElse { error("UPDATE_INVALID", it.message) }
@@ -289,6 +289,7 @@ class LaravelHardwareBridge(
 
     fun notifyUpdateStatus(json: JSONObject) { emit("onUpdateStatus", json.toString()) }
     fun notifyHardwareChanged() { RuntimeLog.add("hardware_changed"); emit("onHardwareChanged", getHardware()) }
+    fun notifyRuntimeSync() { RuntimeLog.add("runtime_sync"); emit("onRuntimeSync", "{}") }
     fun notifyPaymentResult(json: String) { restoreMembershipNfcAfterPayment(); RuntimeLog.add("payment_result", json); emit("onPaymentResult", json) }
     fun notifyNfc(uid: String, readerId: String, readerName: String) {
         if (nfcTestReaderId == readerId) {
@@ -311,6 +312,7 @@ class LaravelHardwareBridge(
 private fun ok() = JSONObject().put("success", true)
     private fun error(code: String, msg: String?) = JSONObject().put("success", false).put("code", code).put("message", msg ?: "").toString()
     companion object {
+        const val BRIDGE_VERSION = 13
         private const val SUNMI_NFC_SETTLE_MS = 700L
         private const val SUNMI_DISPLAY_READY_TIMEOUT_MS = 4_000L
     }

@@ -14,7 +14,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.graphics.Color
 import android.text.InputType
 import android.view.MotionEvent
 import android.view.WindowManager
@@ -36,17 +35,15 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Spinner
-import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.Calendar
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -84,9 +81,15 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
     private val scheduler = Executors.newScheduledThreadPool(2)
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private var serverCheckFuture: ScheduledFuture<*>? = null
     private var heartbeatFuture: ScheduledFuture<*>? = null
+    private var lastConfigFingerprint: String? = null
     private var registrationPollFuture: ScheduledFuture<*>? = null
+    private var webWatchdogFuture: ScheduledFuture<*>? = null
+    private var dailyRebootFuture: ScheduledFuture<*>? = null
+
+    private val startupGraceUntil = android.os.SystemClock.elapsedRealtime() + 45_000L
+    @Volatile private var webWatchdogFailures = 0
+    @Volatile private var webRecoveryInProgress = false
 
     private val checkingServer = AtomicBoolean(false)
     private val openingWebSession = AtomicBoolean(false)
@@ -115,7 +118,7 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        WebView.setWebContentsDebuggingEnabled(true)
+        WebView.setWebContentsDebuggingEnabled(false)
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_main)
@@ -158,6 +161,17 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
                     apkUpdateManager
                 ) { onLaravelHardwareConfigSnapshot(it) }
                 webView.addJavascriptInterface(hardwareBridge, "Android")
+
+                // Cold-start fallback: make NFC usable immediately, before the
+                // Laravel/WebView hardware sync has completed. The existing
+                // Laravel configuration/switching logic remains unchanged.
+                hardwareRegistry.discover()
+                    .firstOrNull { it.type == HardwareType.NFC_READER && it.available }
+                    ?.let { reader ->
+                        RuntimeLog.add("nfc_startup", "reader=${reader.id}")
+                        hardwareBridge.readNfc(reader.id)
+                    }
+
                 webView.post {
                     webView.evaluateJavascript(
                         "window.YchAndroid && window.YchAndroid.sync && window.YchAndroid.sync();",
@@ -176,7 +190,8 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
 
     private fun continueStartup() {
         configureKioskPolicy()
-        startServerChecks()
+        startWebWatchdog()
+        scheduleDailyReboot()
 
         val settings = settingsService.load()
         if (!settings.setupComplete) {
@@ -198,21 +213,16 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
             enterKioskMode()
         }
 
-        // SUNMI: Android ReaderMode nach einem Activity-Resume gezielt
-        // wieder bewaffnen. Die bestehende Host/Customer-Auswahl bleibt
-        // dabei unveraendert; recoverNfc() fuehrt keinen SUNMI-Switch aus.
+        // Nach Boot/Activity-Start den in Laravel gespeicherten NFC-Reader
+        // aktiv starten. Dadurch ist NFC nicht mehr vom Timing des WebView-
+        // Hardware-Syncs abhaengig.
         if (
             !adminMode
             && ::hardwareBridge.isInitialized
             && ::hardwareConfigService.isInitialized
         ) {
-            val readerId = hardwareConfigService.load().nfcReaderId
-
-            if (
-                readerId == "android:nfc:front"
-                || readerId == "android:nfc:customer"
-            ) {
-                hardwareBridge.recoverNfc(readerId)
+            hardwareConfigService.load().nfcReaderId?.let { readerId ->
+                hardwareBridge.readNfc(readerId)
             }
         }
 
@@ -317,8 +327,9 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
                 if (request?.isForMainFrame == true) {
                     lastMainFrameHttpError = -1
                     webLoaded = false
-                    lastError = error?.description?.toString() ?: "WebView-Verbindungsfehler"
-                    showOffline("Die Kassenoberfläche ist derzeit nicht erreichbar.")
+                    handleWebViewConnectionError(
+                        error?.description?.toString() ?: "WebView-Verbindungsfehler"
+                    )
                 }
             }
 
@@ -343,8 +354,7 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
                         initializeTerminal()
                     }
                     else -> {
-                        lastError = "WebView HTTP $code"
-                        showOffline("Die Kassenoberfläche meldet HTTP $code.")
+                        handleWebViewConnectionError("WebView HTTP $code")
                     }
                 }
             }
@@ -386,6 +396,12 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
         webView.setOnFocusChangeListener { _, hasFocus ->
             if (hasFocus && !adminMode) {
                 mainHandler.postDelayed({ hideSystemKeyboard("webview_focus") }, 50)
+            }
+        }
+
+        window.decorView.setOnSystemUiVisibilityChangeListener {
+            if (!adminMode && settingsService.load().setupComplete) {
+                mainHandler.post { hideSystemBars() }
             }
         }
     }
@@ -437,7 +453,7 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
 
             runOnUiThread {
                 when {
-                    result.transportError -> showOffline("Der Server ist nicht erreichbar.")
+                    result.transportError -> handleStartupOffline("Der Server ist nicht erreichbar.")
                     result.statusCode == 503 -> showMaintenanceMode()
                     result.value == "active" -> activateTerminal()
                     result.value != null -> showRegistrationState(result.value)
@@ -465,10 +481,20 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
     private fun deactivateTerminal(status: String?) {
         terminalActive = false
         clearWebSession(clearCookies = false)
-        stopHeartbeat()
+        // Heartbeat bleibt aktiv, damit eine Freigabe im Backend
+        // innerhalb von maximal 10 Sekunden erkannt wird.
         readerService.stop()
         if (::internalNfcService.isInitialized) internalNfcService.stop()
-        showRegistrationState(status ?: "unknown")
+
+        val currentStatus = status ?: "unknown"
+        showStatus(
+            title = "Terminal gesperrt",
+            message = "Laravel meldet den Terminalstatus: $currentStatus\n\nDie Freigabe wird automatisch innerhalb von maximal 10 Sekunden erkannt.",
+            buttonText = "Status prüfen",
+            showProgress = false,
+            action = { initializeTerminal() }
+        )
+        updateDiagnostics()
     }
 
     private fun showUnregisteredTerminal() {
@@ -545,6 +571,9 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
 
             "rejected", "blocked", "disabled", "inactive" -> {
                 stopRegistrationPolling()
+                if (normalized == "disabled" || normalized == "inactive" || normalized == "blocked") {
+                    startHeartbeat()
+                }
                 showStatus(
                     title = "Terminal gesperrt",
                     message = "Laravel meldet den Terminalstatus: $status\n\nDie Freigabe muss im Backend geändert werden.",
@@ -610,7 +639,7 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
 
             runOnUiThread {
                 when {
-                    result.transportError -> showOffline("Die Kassen-Websession konnte nicht erstellt werden.")
+                    result.transportError -> handleStartupOffline("Die Kassen-Websession konnte nicht erstellt werden.")
                     result.statusCode == 503 -> showMaintenanceMode()
                     result.statusCode == 401 || result.statusCode == 403 -> initializeTerminal()
                     result.value.isNullOrBlank() -> {
@@ -639,8 +668,6 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
 
         heartbeatFuture = scheduler.scheduleWithFixedDelay(
             {
-                if (!terminalActive) return@scheduleWithFixedDelay
-
                 networkExecutor.execute {
                     val result = apiService.sendHeartbeat(
                         settings = settingsService.load(),
@@ -660,25 +687,48 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
                             runOnUiThread { checkTerminalAuthorization() }
                         }
                         result.isSuccessful -> {
+                            val previous = lastServerState
                             lastServerState = ApiService.ServerState.ONLINE
                             handleHeartbeatUpdate(result.rawBody)
-                            runOnUiThread { updateDiagnostics() }
+                            runOnUiThread {
+                                if (previous != ApiService.ServerState.ONLINE && !webLoaded && !adminMode) {
+                                    recoverWebView("heartbeat_online")
+                                }
+                                updateDiagnostics()
+                            }
                         }
                         else -> runOnUiThread { checkTerminalAuthorization() }
                     }
                 }
             },
             5,
-            60,
+            10,
             TimeUnit.SECONDS
         )
     }
 
     private fun handleHeartbeatUpdate(rawBody: String) {
-        if (!::apkUpdateManager.isInitialized || rawBody.isBlank()) return
+        if (rawBody.isBlank()) return
 
         runCatching {
             val response = org.json.JSONObject(rawBody)
+
+            val terminalStatus = response.optString("terminal_status", "unknown").trim()
+            if (terminalStatus == "active" && !terminalActive) {
+                runOnUiThread { activateTerminal() }
+            } else if (terminalStatus.isNotBlank() && terminalStatus != "active" && terminalActive) {
+                runOnUiThread { deactivateTerminal(terminalStatus) }
+            }
+
+            val configFingerprint = response.optString("config_fingerprint", "").trim()
+            if (configFingerprint.isNotBlank()) {
+                val previousFingerprint = lastConfigFingerprint
+                lastConfigFingerprint = configFingerprint
+                if (previousFingerprint != null && previousFingerprint != configFingerprint) {
+                    hardwareBridge.notifyRuntimeSync()
+                }
+            }
+
             val update = when {
                 response.optJSONObject("update") != null -> response.getJSONObject("update")
                 response.optJSONObject("app_update") != null -> response.getJSONObject("app_update")
@@ -689,7 +739,7 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
             val apkUrl = update.optString("apkUrl", update.optString("apk_url", "")).trim()
             val sha256 = update.optString("sha256", "").trim()
 
-            if (versionCode > appVersionCode() && apkUrl.isNotBlank() && sha256.isNotBlank()) {
+            if (::apkUpdateManager.isInitialized && versionCode > appVersionCode() && apkUrl.isNotBlank() && sha256.isNotBlank()) {
                 apkUpdateManager.install(
                     org.json.JSONObject()
                         .put("versionCode", versionCode)
@@ -725,35 +775,45 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
         }
     }
 
-    private fun startServerChecks() {
-        serverCheckFuture = scheduler.scheduleWithFixedDelay(
-            { checkServer(showResultToast = false) },
-            0,
-            10,
-            TimeUnit.SECONDS
-        )
-    }
-
     private fun checkServer(showResultToast: Boolean) {
         if (!checkingServer.compareAndSet(false, true)) return
 
         networkExecutor.execute {
-            val state = apiService.testConnection(settingsService.load())
+            val result = apiService.sendHeartbeat(
+                settings = settingsService.load(),
+                readerName = readerService.readerName ?: "",
+                readerStatus = readerService.status,
+                appVersion = appVersion(),
+                appVersionCode = appVersionCode()
+            )
             checkingServer.set(false)
 
             val previous = lastServerState
+            val state = when {
+                result.statusCode == 503 -> ApiService.ServerState.MAINTENANCE
+                result.isSuccessful -> ApiService.ServerState.ONLINE
+                else -> ApiService.ServerState.OFFLINE
+            }
             lastServerState = state
+            if (result.isSuccessful) handleHeartbeatUpdate(result.rawBody)
 
             runOnUiThread {
                 when (state) {
                     ApiService.ServerState.MAINTENANCE -> showMaintenanceMode()
                     ApiService.ServerState.OFFLINE -> {
-                        if (!adminMode) showOffline("Der Laravel-Server ist nicht erreichbar.")
+                        if (!adminMode) handleStartupOffline("Der Laravel-Server ist nicht erreichbar.")
                     }
                     ApiService.ServerState.ONLINE -> {
-                        if (maintenanceMode || previous != ApiService.ServerState.ONLINE) {
-                            maintenanceMode = false
-                            if (settingsService.load().setupComplete) initializeTerminal()
+                        maintenanceMode = false
+
+                        when {
+                            showResultToast && terminalActive && !webLoaded && !adminMode -> {
+                                recoverWebView("manual_heartbeat_online")
+                            }
+                            previous != ApiService.ServerState.ONLINE &&
+                                settingsService.load().setupComplete -> {
+                                initializeTerminal()
+                            }
                         }
                     }
                 }
@@ -770,6 +830,196 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
                 updateDiagnostics()
             }
         }
+    }
+
+
+    private fun handleWebViewConnectionError(message: String) {
+        if (maintenanceMode || adminMode || !terminalActive) return
+
+        lastError = message
+
+        // A WebView transport error (especially directly after display sleep/resume)
+        // does not prove that Laravel is offline. Confirm reachability through the
+        // API first and only show the offline overlay for a confirmed outage.
+        if (!checkingServer.compareAndSet(false, true)) return
+
+        networkExecutor.execute {
+            val result = apiService.sendHeartbeat(
+                settings = settingsService.load(),
+                readerName = readerService.readerName ?: "",
+                readerStatus = readerService.status,
+                appVersion = appVersion(),
+                appVersionCode = appVersionCode()
+            )
+            checkingServer.set(false)
+
+            val state = when {
+                result.statusCode == 503 -> ApiService.ServerState.MAINTENANCE
+                result.isSuccessful -> ApiService.ServerState.ONLINE
+                else -> ApiService.ServerState.OFFLINE
+            }
+            val previous = lastServerState
+            lastServerState = state
+            if (result.isSuccessful) handleHeartbeatUpdate(result.rawBody)
+
+            runOnUiThread {
+                when (state) {
+                    ApiService.ServerState.ONLINE -> {
+                        maintenanceMode = false
+                        if (!webRecoveryInProgress) {
+                            recoverWebView("webview_error_server_online")
+                        }
+                    }
+                    ApiService.ServerState.MAINTENANCE -> showMaintenanceMode()
+                    ApiService.ServerState.OFFLINE -> {
+                        showOffline("Der Laravel-Server ist nicht erreichbar.")
+                    }
+                }
+
+                if (previous != state) updateDiagnostics()
+            }
+        }
+    }
+
+    private fun handleStartupOffline(message: String) {
+        if (android.os.SystemClock.elapsedRealtime() < startupGraceUntil) {
+            showStatus(
+                title = "Kassa wird gestartet",
+                message = "Netzwerk und Server werden vorbereitet …",
+                showProgress = true
+            )
+            return
+        }
+        showOffline(message)
+    }
+
+    /**
+     * WebView watchdog. It never reloads while Laravel reports an active sale/payment.
+     * Server reachability remains the source of truth; this only recovers a stale WebView.
+     */
+    private fun startWebWatchdog() {
+        if (webWatchdogFuture?.isCancelled == false && webWatchdogFuture?.isDone == false) return
+
+        webWatchdogFuture = scheduler.scheduleWithFixedDelay(
+            {
+                if (adminMode || maintenanceMode || !terminalActive || lastServerState != ApiService.ServerState.ONLINE) {
+                    return@scheduleWithFixedDelay
+                }
+
+                runOnUiThread {
+                    if (webRecoveryInProgress) return@runOnUiThread
+
+                    if (!webLoaded) {
+                        webWatchdogFailures++
+                        if (webWatchdogFailures >= 2) {
+                            recoverWebView("not_loaded")
+                        }
+                        return@runOnUiThread
+                    }
+
+                    webView.evaluateJavascript(
+                        "(function(){try{return JSON.stringify({ready:document.readyState==='complete',busy:!!document.querySelector('[data-kasse-busy=\"1\"],[data-kasse-active=\"1\"]'),body:!!document.body});}catch(e){return JSON.stringify({ready:false,busy:true,body:false});}})();"
+                    ) { raw ->
+                        val decoded = raw?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"") ?: ""
+                        val healthy = decoded.contains("\"ready\":true") && decoded.contains("\"body\":true")
+                        val busy = decoded.contains("\"busy\":true")
+
+                        if (healthy) {
+                            webWatchdogFailures = 0
+                        } else if (!busy) {
+                            webWatchdogFailures++
+                            if (webWatchdogFailures >= 2) recoverWebView("healthcheck_failed")
+                        }
+                    }
+                }
+            },
+            20,
+            15,
+            TimeUnit.SECONDS
+        )
+    }
+
+    private fun recoverWebView(reason: String) {
+        if (webRecoveryInProgress || adminMode || maintenanceMode || !terminalActive) return
+        webRecoveryInProgress = true
+        webWatchdogFailures = 0
+        RuntimeLog.add("webview_recovery", reason)
+
+        webView.evaluateJavascript(
+            "(function(){return !!document.querySelector('[data-kasse-busy=\"1\"],[data-kasse-active=\"1\"]');})();"
+        ) { busyRaw ->
+            if (busyRaw == "true") {
+                webRecoveryInProgress = false
+                return@evaluateJavascript
+            }
+
+            webLoaded = false
+            webView.stopLoading()
+            loadWebSession()
+            mainHandler.postDelayed({ webRecoveryInProgress = false }, 5_000L)
+        }
+    }
+
+    private fun scheduleDailyReboot() {
+        dailyRebootFuture?.cancel(false)
+
+        val now = Calendar.getInstance()
+        val next = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 5)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            if (!after(now)) add(Calendar.DAY_OF_YEAR, 1)
+        }
+
+        val delayMs = (next.timeInMillis - now.timeInMillis).coerceAtLeast(1_000L)
+        RuntimeLog.add("daily_reboot_scheduled", next.time.toString())
+
+        dailyRebootFuture = scheduler.schedule(
+            { runOnUiThread { attemptDailyReboot() } },
+            delayMs,
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun attemptDailyReboot() {
+        if (adminMode) {
+            deferDailyReboot("admin_mode")
+            return
+        }
+
+        webView.evaluateJavascript(
+            "(function(){return !!document.querySelector('[data-kasse-busy=\"1\"],[data-kasse-active=\"1\"]');})();"
+        ) { busyRaw ->
+            if (busyRaw == "true") {
+                deferDailyReboot("active_sale")
+                return@evaluateJavascript
+            }
+
+            val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+            if (!dpm.isDeviceOwnerApp(packageName) || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+                RuntimeLog.add("daily_reboot_skipped", "device_owner_required")
+                scheduleDailyReboot()
+                return@evaluateJavascript
+            }
+
+            val admin = ComponentName(this, KioskDeviceAdminReceiver::class.java)
+            RuntimeLog.add("daily_reboot", "05:00")
+            runCatching { dpm.reboot(admin) }
+                .onFailure {
+                    RuntimeLog.add("daily_reboot_failed", it.message ?: it.javaClass.simpleName)
+                    scheduleDailyReboot()
+                }
+        }
+    }
+
+    private fun deferDailyReboot(reason: String) {
+        RuntimeLog.add("daily_reboot_deferred", reason)
+        dailyRebootFuture = scheduler.schedule(
+            { runOnUiThread { attemptDailyReboot() } },
+            5,
+            TimeUnit.MINUTES
+        )
     }
 
     private fun clearWebSession(clearCookies: Boolean) {
@@ -1065,7 +1315,7 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
                 val hw = hardwareConfigService.load()
                 appendLine("SumUp:            ${hw.paymentProviderId ?: "Laravel / externer Reader"}")
             }
-            appendLine("App:              ${appVersion()} · Bridge v9")
+            appendLine("App:              ${appVersion()} · Bridge v${LaravelHardwareBridge.BRIDGE_VERSION}")
             appendLine()
             appendLine("LETZTER VORGANG")
             appendLine("UID:              ${lastUid ?: "Keine"}")
@@ -1081,12 +1331,6 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
             appendLine("Kiosk:            ${lockTaskText(activityManager.lockTaskModeState)}")
             if (::apkUpdateManager.isInitialized) appendLine("Update:           ${apkUpdateManager.status().optString("state", "idle")}")
         }
-    }
-
-    private fun serverStateText(state: ApiService.ServerState): String = when (state) {
-        ApiService.ServerState.ONLINE -> "Online"
-        ApiService.ServerState.MAINTENANCE -> "Wartung"
-        ApiService.ServerState.OFFLINE -> "Offline"
     }
 
     private fun lockTaskText(state: Int): String = when (state) {
@@ -1247,6 +1491,14 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
             customerDisplayManager.blank()
         }
 
+        // NFC muss auch beim Kaltstart aktiv werden. Der WebView-Sync bleibt
+        // zusaetzlich bestehen, ist aber nicht mehr die einzige Startquelle.
+        if (::hardwareBridge.isInitialized) {
+            config.nfcReaderId?.let { readerId ->
+                webView.post { hardwareBridge.readNfc(readerId) }
+            }
+        }
+
         updateDiagnostics()
     }
 
@@ -1265,7 +1517,7 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
         }
         val text = buildString {
             appendLine("Konfiguration: ausschließlich Laravel (nur Anzeige)")
-            appendLine("Bridge: v13")
+            appendLine("Bridge: v${LaravelHardwareBridge.BRIDGE_VERSION}")
             appendLine()
             appendLine(status("Mitglieder-/NFC-Reader", config.nfcReaderId))
             appendLine()
@@ -1383,15 +1635,6 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
             Settings.Secure.DEFAULT_INPUT_METHOD
         ).orEmpty()
 
-    private fun currentInputMethod(): String {
-        val id = currentInputMethodId()
-        return when {
-            id.contains("com.google.android.inputmethod.latin", ignoreCase = true) -> "Gboard"
-            id.isBlank() -> "Unbekannt"
-            else -> id.substringBefore('/')
-        }
-    }
-
     /**
      * Gboard bleibt dauerhaft die System-IME. Im Kassenbetrieb wird sie nur
      * ausgeblendet; die Laravel-Tastatur bleibt davon unberuehrt.
@@ -1417,12 +1660,6 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
                 "reason=$reason;ime=${currentInputMethodId()};result=$shown;target=${target.javaClass.simpleName}"
             )
         }, 120)
-    }
-
-    private fun openKeyboardSettings() {
-        exitKioskMode()
-        RuntimeLog.add("keyboard_settings_open", "ime=${currentInputMethodId()}")
-        startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
     }
 
     private fun matchWidthParams(): LinearLayout.LayoutParams =
@@ -1509,32 +1746,18 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
         )
     }
 
-    @Suppress("DEPRECATION")
     private fun hideSystemBars() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.statusBarColor = Color.TRANSPARENT
-        window.navigationBarColor = Color.TRANSPARENT
-
-        window.decorView.systemUiVisibility =
-            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-            View.SYSTEM_UI_FLAG_FULLSCREEN or
-            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-            View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-            View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-
-        ViewCompat.getWindowInsetsController(window.decorView)?.let { controller ->
-            controller.systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            controller.hide(WindowInsetsCompat.Type.statusBars())
-            controller.hide(WindowInsetsCompat.Type.navigationBars())
-        }
+        ViewCompat.getWindowInsetsController(window.decorView)?.hide(
+            WindowInsetsCompat.Type.systemBars()
+        )
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus && !adminMode && settingsService.load().setupComplete) {
-            hideSystemBars()
+            enterKioskMode()
+            mainHandler.postDelayed({ hideSystemBars() }, 100)
             mainHandler.postDelayed({ hideSystemKeyboard("window_focus") }, 80)
         }
     }
@@ -1554,9 +1777,10 @@ class MainActivity : AppCompatActivity(), ReaderService.Listener {
     }
 
     override fun onDestroy() {
-        serverCheckFuture?.cancel(true)
         heartbeatFuture?.cancel(true)
         registrationPollFuture?.cancel(true)
+        webWatchdogFuture?.cancel(true)
+        dailyRebootFuture?.cancel(true)
 
         if (::hardwareChangeMonitor.isInitialized) hardwareChangeMonitor.dispose()
         if (::apkUpdateManager.isInitialized) apkUpdateManager.dispose()
